@@ -7,7 +7,9 @@ requires-python = ">=3.13"
 dependencies = [
     "copier>=9.14.0",
     "gymnasium>=1.2.3",
+    "keyboard>=0.13.5",
     "numpy>=2.4.3",
+    "pygame>=2.6.1",
     "tensorboard>=2.20.0",
     "torch>=2.10.0",
     "tyro>=1.0.10",
