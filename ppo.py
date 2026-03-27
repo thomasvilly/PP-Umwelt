@@ -4,7 +4,10 @@ import random
 import time
 from dataclasses import dataclass
 
+from collections import deque
+
 import gymnasium as gym
+import gymnasium_env  # registers gymnasium_env/GridWorld-v0
 import numpy as np
 import torch
 import torch.nn as nn
@@ -38,13 +41,23 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
-    """the id of the environment"""
+    env_id: str = "gymnasium_env/GridWorld-v0"
+    """the id of the environment (used for run naming)"""
+    curriculum_strategy: str = "allopoietic"
+    """curriculum expansion strategy: allopoietic | spdl | homeostatic"""
+    expand_every_n: int = 50
+    """allopoietic: expand every N iterations (ignored if expand_every_n_episodes > 0)"""
+    spdl_reward_threshold: float = 0.7
+    """spdl: expand when mean episodic return over last rollout exceeds this"""
+    max_level: int = 3
+    """maximum curriculum level (0-3 for static walls, 4 adds dynamic objects)"""
+    start_level: int = 0
+    """curriculum level to begin training at"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 4
+    num_envs: int = 16
     """the number of parallel game environments"""
     num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
@@ -72,6 +85,8 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
+    hidden_state_size: int = 64
+    """size of the hidden states in actor & critic nets"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -82,13 +97,13 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, run_name):
+def make_env(level, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.make("gymnasium_env/GridWorld-v0", render_mode="rgb_array", level=level)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
+            env = gym.make("gymnasium_env/GridWorld-v0", level=level)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
 
@@ -105,18 +120,18 @@ class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), args.hidden_state_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(args.hidden_state_size, args.hidden_state_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(args.hidden_state_size, 1), std=1.0),
         )
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), args.hidden_state_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(args.hidden_state_size, args.hidden_state_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            layer_init(nn.Linear(args.hidden_state_size, envs.single_action_space.n), std=0.01),
         )
 
     def get_value(self, x):
@@ -163,8 +178,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
+    current_level = args.start_level
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(current_level, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
@@ -186,12 +202,24 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
+    # Curriculum and signal tracking state
+    steps_since_expansion = 0
+    lr_reset_iteration = 1  # iteration from which current LR annealing started
+    rolling_critic_buf = deque(maxlen=10)
+    rollout_returns = []
+    rollout_successes = []
+    rollout_path_efficiencies = []
+
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+            frac = 1.0 - (iteration - lr_reset_iteration) / args.num_iterations
+            frac = max(frac, 0.0)
+            optimizer.param_groups[0]["lr"] = frac * args.learning_rate
+
+        rollout_returns.clear()
+        rollout_successes.clear()
+        rollout_path_efficiencies.clear()
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -211,12 +239,23 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+            # gymnasium 1.x: episode stats are in infos["episode"] with mask infos["_episode"]
+            if "episode" in infos:
+                ep_mask = infos.get("_episode", np.ones(args.num_envs, dtype=bool))
+                for i in range(args.num_envs):
+                    if ep_mask[i]:
+                        ep_return = float(infos["episode"]["r"][i])
+                        ep_length = int(infos["episode"]["l"][i])
+                        print(f"global_step={global_step}, episodic_return={ep_return:.3f}")
+                        writer.add_scalar("charts/episodic_return", ep_return, global_step)
+                        writer.add_scalar("charts/episodic_length", ep_length, global_step)
+                        rollout_returns.append(ep_return)
+                        # return > 0 means goal was reached (step penalty alone can't yield > 0)
+                        success = ep_return > 0
+                        rollout_successes.append(success)
+                        opt_path = int(infos["optimal_path_length"][i]) if "optimal_path_length" in infos else -1
+                        if success and opt_path > 0:
+                            rollout_path_efficiencies.append(opt_path / ep_length)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -245,6 +284,8 @@ if __name__ == "__main__":
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+        iter_grad_norms, iter_actor_gnorms, iter_critic_gnorms = [], [], []
+        iter_critic_losses, iter_entropies = [], []
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -290,8 +331,16 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                # Compute separate actor/critic norms before joint clipping
+                actor_gnorm  = nn.utils.clip_grad_norm_(agent.actor.parameters(),  float('inf')).item()
+                critic_gnorm = nn.utils.clip_grad_norm_(agent.critic.parameters(), float('inf')).item()
+                grad_norm    = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm).item()
                 optimizer.step()
+                iter_grad_norms.append(grad_norm)
+                iter_actor_gnorms.append(actor_gnorm)
+                iter_critic_gnorms.append(critic_gnorm)
+                iter_critic_losses.append(v_loss.item())
+                iter_entropies.append(entropy_loss.item())
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
@@ -299,6 +348,26 @@ if __name__ == "__main__":
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+        # --- Internal signal vector (computed once per iteration) ---
+        gnorm_mean  = float(np.mean(iter_grad_norms))
+        gnorm_var   = float(np.var(iter_grad_norms))
+        closs_mean  = float(np.mean(iter_critic_losses))
+        closs_var   = float(np.var(iter_critic_losses))
+        ent_mean    = float(np.mean(iter_entropies))
+        rolling_critic_buf.append(closs_mean)
+        rolling_closs_mean = float(np.mean(rolling_critic_buf))
+
+        # Rollout-level value and advantage stats
+        value_mean = values.mean().item()
+        value_std  = values.std().item()
+        adv_mean   = b_advantages.mean().item()
+        adv_std    = b_advantages.std().item()
+
+        # Episode-level stats accumulated during this rollout
+        mean_return   = float(np.mean(rollout_returns))          if rollout_returns          else float('nan')
+        success_rate  = float(np.mean(rollout_successes))        if rollout_successes        else float('nan')
+        path_eff_mean = float(np.mean(rollout_path_efficiencies)) if rollout_path_efficiencies else float('nan')
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
@@ -311,6 +380,57 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        # Internal physiological signals
+        writer.add_scalar("internal_signals/grad_norm_mean",         gnorm_mean,        global_step)
+        writer.add_scalar("internal_signals/grad_norm_var",          gnorm_var,         global_step)
+        writer.add_scalar("internal_signals/critic_loss_mean",       closs_mean,        global_step)
+        writer.add_scalar("internal_signals/critic_loss_var",        closs_var,         global_step)
+        writer.add_scalar("internal_signals/entropy_mean",           ent_mean,          global_step)
+        writer.add_scalar("internal_signals/rolling_critic_loss",    rolling_closs_mean, global_step)
+        writer.add_scalar("internal_signals/actor_grad_norm_mean",   float(np.mean(iter_actor_gnorms)),  global_step)
+        writer.add_scalar("internal_signals/critic_grad_norm_mean",  float(np.mean(iter_critic_gnorms)), global_step)
+        writer.add_scalar("internal_signals/value_mean",             value_mean,        global_step)
+        writer.add_scalar("internal_signals/value_std",              value_std,         global_step)
+        writer.add_scalar("internal_signals/advantage_mean",         adv_mean,          global_step)
+        writer.add_scalar("internal_signals/advantage_std",          adv_std,           global_step)
+
+        # Episodic stats (only when episodes completed this rollout)
+        if not np.isnan(mean_return):
+            writer.add_scalar("charts/rollout_mean_return", mean_return,   global_step)
+        if not np.isnan(success_rate):
+            writer.add_scalar("charts/success_rate",        success_rate,  global_step)
+        if not np.isnan(path_eff_mean):
+            writer.add_scalar("charts/path_efficiency",     path_eff_mean, global_step)
+
+        # Curriculum tracking
+        writer.add_scalar("curriculum/level",                current_level,         global_step)
+        writer.add_scalar("curriculum/steps_since_expansion", steps_since_expansion, global_step)
+        steps_since_expansion += 1
+
+        # --- Curriculum expansion ---
+        if current_level < args.max_level:
+            should_expand = False
+            if args.curriculum_strategy == "allopoietic":
+                should_expand = (iteration % args.expand_every_n == 0)
+            elif args.curriculum_strategy == "spdl":
+                should_expand = (not np.isnan(mean_return) and mean_return > args.spdl_reward_threshold)
+            elif args.curriculum_strategy == "homeostatic":
+                pass  # placeholder — gate not yet implemented
+
+            if should_expand:
+                current_level += 1
+                steps_since_expansion = 0
+                lr_reset_iteration = iteration
+                envs.close()
+                envs = gym.vector.SyncVectorEnv(
+                    [make_env(current_level, i, args.capture_video, run_name) for i in range(args.num_envs)]
+                )
+                next_obs, _ = envs.reset(seed=args.seed)
+                next_obs = torch.Tensor(next_obs).to(device)
+                next_done = torch.zeros(args.num_envs).to(device)
+                print(f"*** Curriculum expanded to level {current_level} at iteration {iteration} ***")
+                writer.add_scalar("curriculum/level", current_level, global_step)
 
     envs.close()
     writer.close()
