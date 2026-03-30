@@ -20,6 +20,17 @@ from torch.utils.tensorboard import SummaryWriter
 CleanRL ppo implementation
 """
 
+# 4-dim analytic environment descriptor per curriculum level.
+# [normalised_grid_cells, normalised_wall_count, stochasticity_flag, normalised_horizon]
+# Used by lc_gate and offline_gate strategies; no prior runs needed.
+_ENV_DESC: dict = {
+    0: [25/169,   0,    0, 25/169],   # 5×5, no walls, static
+    1: [49/169,   0,    0, 49/169],   # 7×7, no walls, static
+    2: [121/169,  0,    0, 121/169],  # 11×11, no walls, static
+    3: [169/169,  0,    0, 169/169],  # 13×13, no walls, static
+    4: [81/169,   1/81, 1, 81/169],   # 9×9, 1 dynamic wall, stochastic
+}
+
 
 @dataclass
 class Args:
@@ -44,7 +55,7 @@ class Args:
     env_id: str = "gymnasium_env/GridWorld-v0"
     """the id of the environment (used for run naming)"""
     curriculum_strategy: str = "allopoietic"
-    """curriculum expansion strategy: allopoietic | spdl | heuristic | homeostatic"""
+    """curriculum expansion strategy: allopoietic | spdl | domain_rand | heuristic | lc_gate | offline_gate | level_selector"""
     expand_every_n: int = 50
     """allopoietic: expand every N iterations"""
     spdl_reward_threshold: float = 0.7
@@ -71,10 +82,37 @@ class Args:
     """threshold for critic grad norm gate: expand when critic_grad_norm_mean drops below this; 0 = disabled."""
     actor_only_param_delta: bool = False
     """if True, param_delta gate uses actor delta only (not requiring critic to also stabilise)."""
+
+    # Level-conditioned gate (curriculum_strategy="lc_gate")
+    # Online BCE gate: input = 7-dim sig_vec + 4-dim env descriptor = 11-dim (or 7-dim GRPO)
+    lc_gate_lr:         float = 1e-3  # Adam lr
+    lc_gate_k:          int   = 5     # K-rollout EV look-ahead for labels
+    lc_gate_thr:        float = 0.5   # p(expand) threshold
+    lc_gate_grpo_safe:  bool  = False # if True, use 3-dim GRPO signals → 7-dim input
+
+    # Offline meta-learned gate (curriculum_strategy="offline_gate")
+    # Frozen gate trained offline on Phase 2 sweep data (see offline_gate.py)
+    offline_gate_path:      str   = "offline_gate.pt"  # path to saved weights
+    offline_gate_thr:       float = 0.5                # p(expand) threshold
+    offline_gate_grpo_safe: bool  = False              # if True, 3-dim GRPO signals → 7-dim input
+
+    # Domain randomization data logging — used to generate training data for offline gate v2
+    domain_rand_log_path: str = ""
+    """if non-empty, save per-rollout (sig_vec, level, EV, return) as .npy at end of run"""
+
+    # Level selector (curriculum_strategy="level_selector")
+    # Outcome regressor trained on domain-rand data (see offline_gate_v2.py).
+    # Queried once per candidate level; switches to level with highest predicted outcome.
+    level_selector_path:      str  = ""     # path to offline_gate_v2.pt
+    level_selector_grpo_safe: bool = False  # if True, use 3-dim GRPO signals → 7-dim input
+
+    level_sequence: str = ""
+    """comma-separated curriculum level sequence, e.g. '0,1,2,3' or '0,1,3' or '0,1,2,3,4'.
+    Overrides start_level/max_level when set."""
     max_level: int = 3
-    """maximum curriculum level (0-3 for static walls, 4 adds dynamic objects)"""
+    """maximum curriculum level (0-3 for static walls, 4 adds dynamic objects); ignored when level_sequence is set"""
     start_level: int = 0
-    """curriculum level to begin training at"""
+    """curriculum level to begin training at; ignored when level_sequence is set"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
@@ -172,6 +210,13 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+
+    # Parse curriculum level sequence
+    if args.level_sequence:
+        _level_seq = [int(x.strip()) for x in args.level_sequence.split(",") if x.strip()]
+    else:
+        _level_seq = list(range(args.start_level, args.max_level + 1))
+    _level_seq_idx = 0
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -200,7 +245,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    current_level = args.start_level
+    current_level = _level_seq[0]
     envs = gym.vector.SyncVectorEnv(
         [make_env(current_level, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
@@ -208,6 +253,61 @@ if __name__ == "__main__":
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    # Level-conditioned gate: online BCE MLP, 11-dim (or 7-dim GRPO) input
+    lc_gate = lc_gate_opt = lc_bce = None
+    lc_buf: list = []
+    lc_ev_hist: list = []
+    lc_warmup_done = False
+    lc_gate_prob = 0.0
+    if args.curriculum_strategy == "lc_gate":
+        _lc_in = (3 if args.lc_gate_grpo_safe else 7) + 4
+        lc_gate = nn.Sequential(
+            nn.Linear(_lc_in, 16), nn.ReLU(), nn.Linear(16, 1), nn.Sigmoid()
+        ).to(device)
+        lc_gate_opt = torch.optim.Adam(lc_gate.parameters(), lr=args.lc_gate_lr)
+        lc_bce = nn.BCELoss()
+
+    # Offline gate: frozen MLP loaded from disk (weights + z-score normalisation params)
+    offline_gate = None
+    offline_gate_mu = offline_gate_sigma = None
+    offline_gate_prob = 0.0
+    if args.curriculum_strategy == "offline_gate":
+        import os as _os
+        _og_in = (3 if args.offline_gate_grpo_safe else 7) + 4
+        offline_gate = nn.Sequential(
+            nn.Linear(_og_in, 16), nn.ReLU(), nn.Linear(16, 1), nn.Sigmoid()
+        ).to(device)
+        if _os.path.exists(args.offline_gate_path):
+            _ckpt = torch.load(args.offline_gate_path, map_location=device)
+            if isinstance(_ckpt, dict) and "state_dict" in _ckpt:
+                offline_gate.load_state_dict(_ckpt["state_dict"])
+                offline_gate_mu    = _ckpt["mu"].to(device)
+                offline_gate_sigma = _ckpt["sigma"].to(device)
+            else:
+                offline_gate.load_state_dict(_ckpt)  # legacy format (no normalisation)
+        else:
+            print(f"[offline_gate] WARNING: {args.offline_gate_path} not found — gate will be random")
+        offline_gate.eval()
+
+    # Level selector: frozen outcome regressor, trained on domain-rand data (offline_gate_v2.py)
+    # Queries model once per candidate level; selects level with highest predicted outcome.
+    level_selector = None; level_selector_mu = level_selector_sigma = None
+    if args.curriculum_strategy == "level_selector":
+        import os as _os4
+        _ls_in = (3 if args.level_selector_grpo_safe else 7) + 4
+        level_selector = nn.Sequential(
+            nn.Linear(_ls_in, 16), nn.ReLU(), nn.Linear(16, 1)
+        ).to(device)
+        if _os4.path.exists(args.level_selector_path):
+            _ls_ckpt = torch.load(args.level_selector_path, map_location=device)
+            level_selector.load_state_dict(_ls_ckpt["state_dict"])
+            if "mu" in _ls_ckpt:
+                level_selector_mu    = _ls_ckpt["mu"].to(device)
+                level_selector_sigma = _ls_ckpt["sigma"].to(device)
+        else:
+            print(f"[level_selector] WARNING: {args.level_selector_path} not found — scores will be random")
+        level_selector.eval()
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -249,6 +349,15 @@ if __name__ == "__main__":
         y = np.array(buf, dtype=np.float64)
         return float(np.polyfit(np.arange(len(y), dtype=np.float64), y, 1)[0])
 
+    # Running z-score state (Welford online algorithm) — shared by domain_rand_log and level_selector
+    sig_vec   = np.zeros(7, dtype=np.float32)   # safe default before first rollout completes
+    sig_vec_z = np.zeros(7, dtype=np.float32)
+    _ev_prev  = float("nan")
+    _rs_n    = 0
+    _rs_mean = np.zeros(7, dtype=np.float64)
+    _rs_M2   = np.zeros(7, dtype=np.float64)
+    _dr_rows: list = []
+
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -265,6 +374,34 @@ if __name__ == "__main__":
             new_active = int(np.random.randint(0, current_level + 1))
             if new_active != active_level:
                 active_level = new_active
+                envs.close()
+                envs = gym.vector.SyncVectorEnv(
+                    [make_env(active_level, i, args.capture_video, run_name) for i in range(args.num_envs)]
+                )
+                next_obs, _ = envs.reset(seed=args.seed + iteration)
+                next_obs = torch.Tensor(next_obs).to(device)
+                next_done = torch.zeros(args.num_envs).to(device)
+
+        # Level selector: query regressor for each candidate level, pick highest predicted outcome.
+        # Fires every rollout; can advance, stay, or retreat. Warmup: wait until _rs_n >= 5.
+        if args.curriculum_strategy == "level_selector" and level_selector is not None and _rs_n >= 5:
+            _lsel_sig_np = sig_vec_z[[2, 5, 6]] if args.level_selector_grpo_safe else sig_vec_z
+            _lsel_sig = torch.tensor(_lsel_sig_np, dtype=torch.float32, device=device)
+            _lsel_scores: dict = {}
+            with torch.no_grad():
+                for _lv in _level_seq:
+                    _lsel_env = torch.tensor(_ENV_DESC[_lv], dtype=torch.float32, device=device)
+                    _lsel_in  = torch.cat([_lsel_sig, _lsel_env]).unsqueeze(0)
+                    if level_selector_mu is not None:
+                        _lsel_in = (_lsel_in - level_selector_mu) / level_selector_sigma
+                    _lsel_scores[_lv] = level_selector(_lsel_in).item()
+            _lsel_level = max(_lsel_scores, key=_lsel_scores.get)
+            for _lv, _sc in _lsel_scores.items():
+                writer.add_scalar(f"level_selector/score_{_lv}", _sc, global_step)
+            writer.add_scalar("level_selector/selected", _lsel_level, global_step)
+            if _lsel_level != active_level:
+                active_level = _lsel_level
+                current_level = max(current_level, active_level)
                 envs.close()
                 envs = gym.vector.SyncVectorEnv(
                     [make_env(active_level, i, args.capture_video, run_name) for i in range(args.num_envs)]
@@ -434,6 +571,71 @@ if __name__ == "__main__":
         param_delta_history.append(param_delta_actor)
         param_delta_slope  = linslope(param_delta_history)
 
+        # 7-dim signal vector for D3 (assembled every rollout; negligible cost)
+        # Order: [EV, EV_slope, adv_std, crit_gnorm_slope, crit_gnorm_mean, entropy, actor_gnorm_slope]
+        sig_vec = np.array([
+            explained_var, expl_var_slope, adv_std,
+            critic_gnorm_slope, float(np.mean(iter_critic_gnorms)),
+            ent_mean, actor_gnorm_slope,
+        ], dtype=np.float32)
+
+        # Welford running z-score (per-run online normalization, used by level_selector + domain_rand_log)
+        _rs_n += 1
+        _rs_d       = sig_vec.astype(np.float64) - _rs_mean
+        _rs_mean   += _rs_d / _rs_n
+        _rs_M2     += _rs_d * (sig_vec.astype(np.float64) - _rs_mean)
+        _rs_std     = np.sqrt(np.maximum(_rs_M2 / max(_rs_n - 1, 1), 1e-12)).astype(np.float32)
+        sig_vec_z   = ((sig_vec - _rs_mean.astype(np.float32)) / _rs_std).astype(np.float32)
+
+        # Domain randomization data logging
+        if args.domain_rand_log_path:
+            _mean_ret = float(np.mean(rollout_returns))   if rollout_returns   else 0.0
+            _mean_suc = float(np.mean(rollout_successes)) if rollout_successes else 0.0
+            _dr_rows.append(np.concatenate([
+                [iteration, active_level],
+                sig_vec,                                       # raw  cols 2-8
+                sig_vec_z,                                     # z    cols 9-15
+                [explained_var, _ev_prev if not np.isnan(_ev_prev) else explained_var,
+                 _mean_ret, _mean_suc],                        # cols 16-19
+            ]).astype(np.float32))
+        _ev_prev = explained_var
+
+        # --- Level-conditioned gate: per-rollout online update + inference ---
+        if lc_gate is not None:
+            _grpo_idx = [2, 5, 6]  # adv_std, entropy_mean, actor_gnorm_slope
+            _sig = sig_vec[_grpo_idx] if args.lc_gate_grpo_safe else sig_vec
+            _env_desc = torch.tensor(_ENV_DESC[current_level], dtype=torch.float32, device=device)
+            _gate_in  = torch.cat([torch.tensor(_sig, dtype=torch.float32, device=device), _env_desc])
+            lc_buf.append((_gate_in.detach(), explained_var))
+            lc_ev_hist.append(explained_var)
+            if len(lc_buf) > args.lc_gate_k:
+                _old_in, _old_ev = lc_buf.pop(0)
+                _label = float(np.mean(lc_ev_hist[-args.lc_gate_k:]) > _old_ev)
+                lc_ev_hist.pop(0)
+                lc_gate_opt.zero_grad()
+                _pred = lc_gate(_old_in.unsqueeze(0))
+                _loss = lc_bce(_pred, torch.tensor([[_label]], dtype=torch.float32, device=device))
+                _loss.backward()
+                lc_gate_opt.step()
+                lc_warmup_done = True
+                writer.add_scalar("lc_gate/loss",  _loss.item(), global_step)
+                writer.add_scalar("lc_gate/label", _label,       global_step)
+            with torch.no_grad():
+                lc_gate_prob = lc_gate(_gate_in.unsqueeze(0)).item() if lc_warmup_done else 0.0
+            writer.add_scalar("lc_gate/prob", lc_gate_prob, global_step)
+
+        # --- Offline gate: frozen inference only ---
+        if offline_gate is not None:
+            _grpo_idx = [2, 5, 6]
+            _sig = sig_vec[_grpo_idx] if args.offline_gate_grpo_safe else sig_vec
+            _env_desc = torch.tensor(_ENV_DESC[current_level], dtype=torch.float32, device=device)
+            _gate_in  = torch.cat([torch.tensor(_sig, dtype=torch.float32, device=device), _env_desc])
+            with torch.no_grad():
+                if offline_gate_mu is not None:
+                    _gate_in = (_gate_in - offline_gate_mu) / offline_gate_sigma
+                offline_gate_prob = offline_gate(_gate_in.unsqueeze(0)).item()
+            writer.add_scalar("offline_gate/prob", offline_gate_prob, global_step)
+
         # Episode-level stats accumulated during this rollout
         mean_return   = float(np.mean(rollout_returns))          if rollout_returns          else float('nan')
         success_rate  = float(np.mean(rollout_successes))        if rollout_successes        else float('nan')
@@ -488,7 +690,7 @@ if __name__ == "__main__":
         steps_since_expansion += 1
 
         # --- Curriculum expansion ---
-        if current_level < args.max_level:
+        if _level_seq_idx < len(_level_seq) - 1:
             should_expand = False
             if args.curriculum_strategy == "allopoietic":
                 should_expand = (iteration % args.expand_every_n == 0)
@@ -524,9 +726,15 @@ if __name__ == "__main__":
                 elif sig == "crit_gnorm_abs":    should_expand = _lt(float(np.mean(iter_critic_gnorms)), args.crit_gnorm_abs_eps)
             elif args.curriculum_strategy == "homeostatic":
                 pass  # placeholder — learned gate not yet implemented
+            elif args.curriculum_strategy == "lc_gate":
+                should_expand = lc_warmup_done and lc_gate_prob > args.lc_gate_thr
+            elif args.curriculum_strategy == "offline_gate":
+                # Mirror the window_full guard from the training label (steps_since_expansion >= W_MIN=5)
+                should_expand = steps_since_expansion >= 5 and offline_gate_prob > args.offline_gate_thr
 
             if should_expand:
-                current_level += 1
+                _level_seq_idx += 1
+                current_level = _level_seq[_level_seq_idx]
                 active_level = current_level
                 steps_since_expansion = 0
                 lr_reset_iteration = iteration
@@ -535,6 +743,8 @@ if __name__ == "__main__":
                 actor_gnorm_history.clear()
                 critic_gnorm_history.clear()
                 param_delta_history.clear()
+                if lc_gate is not None:     # reset circular buffer at level boundary
+                    lc_buf.clear(); lc_ev_hist.clear(); lc_warmup_done = False
                 envs.close()
                 envs = gym.vector.SyncVectorEnv(
                     [make_env(current_level, i, args.capture_video, run_name) for i in range(args.num_envs)]
@@ -547,3 +757,9 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+
+    if args.domain_rand_log_path and _dr_rows:
+        import os as _os5
+        _os5.makedirs(_os5.path.dirname(_os5.path.abspath(args.domain_rand_log_path)), exist_ok=True)
+        np.save(args.domain_rand_log_path, np.stack(_dr_rows))
+        print(f"[domrand_log] {len(_dr_rows)} rows → {args.domain_rand_log_path}")
