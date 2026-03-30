@@ -11,23 +11,6 @@ from tensorboard.backend.event_processing import event_accumulator
 
 MAX_PARALLEL = 1  # adjust based on GPU/CPU headroom
 
-# ---------------------------------------------------------------------------
-# Ablation sweep: env-sequence × method × budget
-#
-# METHODS  — 3 curriculum strategies
-# ENVS     — 3 level sequences (original 4-level, 5-level + dynamic walls, skip 11×11)
-# BUDGETS  — 300k + 400k for env variation; 200k added for budget ablation on 4-level only
-# SEEDS    — 3 seeds per config
-#
-# Total: (3 envs × 3 methods × 2 budgets × 3 seeds) + (3 methods × 1 extra budget × 3 seeds)
-#      = 54 + 9 = 63 runs
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Phase A — domain randomization data collection (run FIRST, before Phase C)
-# Small network (hidden=32) for cheap data; transfer-to-full-net is part of the experiment.
-# Set RUNS = DOMRAND_RUNS to collect data, then train offline_gate_v2.pt via offline_gate_v2.py.
-# ---------------------------------------------------------------------------
 DOMRAND_RUNS = [
     {"curriculum_strategy": "domain_rand",
      "start_level": 3,            # all 4 levels accessible from step 0
@@ -40,22 +23,18 @@ DOMRAND_RUNS = [
     for seed in range(1, 21)      # 20 runs → ~4000-5000 labeled rows
 ]
 
-# ---------------------------------------------------------------------------
-# Phase B/C methods (main ablation — add level-sel after offline_gate_v2.pt is trained)
-# ---------------------------------------------------------------------------
 METHODS = {
-    # Periodic baseline: expand every 8 rollouts regardless of agent state
-    # "allo":    dict(curriculum_strategy="allopoietic", expand_every_n=8),
-    # Best heuristic from Phase 2: fire when critic grad-norm slope flattens
-    # "critgn":  dict(curriculum_strategy="heuristic", heuristic_signal="critic_gnorm",
-    #                 heuristic_eps=0.001, signal_window=5),
-    # Offline gate v1: binary expand/wait, distilled from critgn-w5
-    # "offgate": dict(curriculum_strategy="offline_gate",
-    #                 offline_gate_path="offline_gate_critgn.pt"),
-    # Offline gate v2: N-class level selector trained on domain-rand data
-    # Uncomment after running: uv run python offline_gate_v2.py --data-dir runs/domrand_data
+    "allo-8":    dict(curriculum_strategy="allopoietic", expand_every_n=8),
+    "allo-16": dict(curriculum_strategy="allopoietic", expand_every_n=16),
+    "allo-32": dict(curriculum_strategy="allopoietic", expand_every_n=32),
+    "spdl-07": dict(curriculum_strategy="spdl"),
+    "critgn":  dict(curriculum_strategy="heuristic", heuristic_signal="critic_gnorm",
+                    heuristic_eps=0.001, signal_window=5),
+    "offgate": dict(curriculum_strategy="offline_gate",
+                    offline_gate_path="offline_gate_critgn.pt"),
     "lev-sel": dict(curriculum_strategy="level_selector",
                     level_selector_path="offline_gate_v2.pt"),
+    "domrand": dict(curriculum_strategy="domain_rand", start_level=3, max_level=3),
 }
 
 ENVS = {
@@ -65,12 +44,12 @@ ENVS = {
     "5lv":  dict(level_sequence="0,1,2,3,4"),
     # Skip 11×11: forces a large difficulty jump from 7×7 directly to 13×13
     "skip": dict(level_sequence="0,1,3"),
+    # 5 -> 11 -> 9x9 dynamic
+    "skip-dyn": dict(level_sequence="1,2,4"),
 }
 
-SEEDS = [1, 2, 3]
+SEEDS = [1, 9, 5]
 
-# Part 1 — environment × method × budget (300k + 400k)
-# Tests: does level conditioning and the offline gate generalise across env configs and budgets?
 RUNS = [
     {**method_cfg, **env_cfg,
      "total_timesteps": budget,
@@ -78,23 +57,11 @@ RUNS = [
      "exp_name": f"{mname}-{ename}-b{budget // 1000}k-s{seed}"}
     for mname, method_cfg in METHODS.items()
     for ename, env_cfg in ENVS.items()
-    for budget in [300_000, 400_000]
+    for budget in [200_000, 300_000, 400_000]
     for seed in SEEDS
 ]
 
-# Part 2 — budget ablation on original 4-level only (200k; 300k+400k already in Part 1)
-# Tests: does budget pressure differentially hurt heuristic vs learned methods?
-RUNS += [
-    {**method_cfg, "level_sequence": "0,1,2,3",
-     "total_timesteps": 200_000,
-     "seed": seed,
-     "exp_name": f"{mname}-4lv-b200k-s{seed}"}
-    for mname, method_cfg in METHODS.items()
-    for seed in SEEDS
-]
-
-# RUNS = DOMRAND_RUNS
-
+# RUNS = DOMRAND_RUNS # to generate the domain randomization data to train offline gate
 
 def run_one(cfg: dict) -> tuple:
     exp_name = cfg["exp_name"]
