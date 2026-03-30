@@ -44,11 +44,33 @@ class Args:
     env_id: str = "gymnasium_env/GridWorld-v0"
     """the id of the environment (used for run naming)"""
     curriculum_strategy: str = "allopoietic"
-    """curriculum expansion strategy: allopoietic | spdl | homeostatic"""
+    """curriculum expansion strategy: allopoietic | spdl | heuristic | homeostatic"""
     expand_every_n: int = 50
-    """allopoietic: expand every N iterations (ignored if expand_every_n_episodes > 0)"""
+    """allopoietic: expand every N iterations"""
     spdl_reward_threshold: float = 0.7
     """spdl: expand when mean episodic return over last rollout exceeds this"""
+    signal_window: int = 10
+    """W: rolling window size for slope signals and param-delta (rollouts)"""
+    heuristic_eps: float = 0.0
+    """heuristic gate flat-band threshold for slope signals; 0 = disabled."""
+    heuristic_signal: str = "both"
+    """which signal(s) to use: both | gnorm | expl_var | or | param_delta | adv_std | entropy | kl | ev_abs | crit_gnorm_abs"""
+    param_delta_eps: float = 0.0
+    """threshold for param_delta heuristic (L2 weight change); 0 = disabled."""
+    adv_std_eps: float = 0.0
+    """threshold for adv_std heuristic: expand when advantage std drops below this; 0 = disabled."""
+    entropy_eps: float = 0.0
+    """threshold for entropy heuristic: expand when policy entropy drops below this; 0 = disabled."""
+    kl_eps: float = 0.0
+    """threshold for approx_kl heuristic: expand when per-rollout KL drops below this; 0 = disabled."""
+    clipfrac_eps: float = 0.0
+    """threshold for clipfrac heuristic: expand when clip fraction drops below this; 0 = disabled."""
+    ev_abs_eps: float = 0.0
+    """threshold for point-in-time EV gate: expand when explained_variance exceeds this; 0 = disabled."""
+    crit_gnorm_abs_eps: float = 0.0
+    """threshold for critic grad norm gate: expand when critic_grad_norm_mean drops below this; 0 = disabled."""
+    actor_only_param_delta: bool = False
+    """if True, param_delta gate uses actor delta only (not requiring critic to also stabilise)."""
     max_level: int = 3
     """maximum curriculum level (0-3 for static walls, 4 adds dynamic objects)"""
     start_level: int = 0
@@ -59,7 +81,7 @@ class Args:
     """the learning rate of the optimizer"""
     num_envs: int = 16
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -204,11 +226,28 @@ if __name__ == "__main__":
 
     # Curriculum and signal tracking state
     steps_since_expansion = 0
+    active_level = current_level  # for domain_rand: level envs are currently set to
     lr_reset_iteration = 1  # iteration from which current LR annealing started
     rolling_critic_buf = deque(maxlen=10)
     rollout_returns = []
     rollout_successes = []
     rollout_path_efficiencies = []
+
+    # Rolling window histories — all share window size W (args.signal_window)
+    # signals: grad_norm, expl_var, actor_gnorm, critic_gnorm, param_delta
+    W = args.signal_window
+    grad_norm_history, expl_var_history, actor_gnorm_history, critic_gnorm_history, param_delta_history = (
+        deque(maxlen=W) for _ in range(5)
+    )
+    actor_params_snap  = torch.cat([p.detach().cpu().flatten() for p in agent.actor.parameters()])
+    critic_params_snap = torch.cat([p.detach().cpu().flatten() for p in agent.critic.parameters()])
+
+    def linslope(buf):
+        """Linear regression slope over a rolling deque. Returns 0 if fewer than 2 samples."""
+        if len(buf) < 2:
+            return 0.0
+        y = np.array(buf, dtype=np.float64)
+        return float(np.polyfit(np.arange(len(y), dtype=np.float64), y, 1)[0])
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -220,6 +259,19 @@ if __name__ == "__main__":
         rollout_returns.clear()
         rollout_successes.clear()
         rollout_path_efficiencies.clear()
+
+        # Domain randomisation: resample active level each rollout from unlocked levels
+        if args.curriculum_strategy == "domain_rand" and current_level > 0:
+            new_active = int(np.random.randint(0, current_level + 1))
+            if new_active != active_level:
+                active_level = new_active
+                envs.close()
+                envs = gym.vector.SyncVectorEnv(
+                    [make_env(active_level, i, args.capture_video, run_name) for i in range(args.num_envs)]
+                )
+                next_obs, _ = envs.reset(seed=args.seed + iteration)
+                next_obs = torch.Tensor(next_obs).to(device)
+                next_done = torch.zeros(args.num_envs).to(device)
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -364,6 +416,24 @@ if __name__ == "__main__":
         adv_mean   = b_advantages.mean().item()
         adv_std    = b_advantages.std().item()
 
+        # Rolling window signals — append then compute slope for each tracked signal
+        grad_norm_history.append(gnorm_mean)
+        expl_var_history.append(explained_var)
+        actor_gnorm_history.append(float(np.mean(iter_actor_gnorms)))
+        critic_gnorm_history.append(float(np.mean(iter_critic_gnorms)))
+        gnorm_slope        = linslope(grad_norm_history)
+        expl_var_slope     = linslope(expl_var_history)
+        actor_gnorm_slope  = linslope(actor_gnorm_history)
+        critic_gnorm_slope = linslope(critic_gnorm_history)
+        # param_delta: L2 weight change since last rollout (actor and critic separately)
+        actor_params_now   = torch.cat([p.detach().cpu().flatten() for p in agent.actor.parameters()])
+        critic_params_now  = torch.cat([p.detach().cpu().flatten() for p in agent.critic.parameters()])
+        param_delta_actor  = (actor_params_now  - actor_params_snap).norm().item()
+        param_delta_critic = (critic_params_now - critic_params_snap).norm().item()
+        actor_params_snap, critic_params_snap = actor_params_now, critic_params_now
+        param_delta_history.append(param_delta_actor)
+        param_delta_slope  = linslope(param_delta_history)
+
         # Episode-level stats accumulated during this rollout
         mean_return   = float(np.mean(rollout_returns))          if rollout_returns          else float('nan')
         success_rate  = float(np.mean(rollout_successes))        if rollout_successes        else float('nan')
@@ -394,6 +464,14 @@ if __name__ == "__main__":
         writer.add_scalar("internal_signals/value_std",              value_std,         global_step)
         writer.add_scalar("internal_signals/advantage_mean",         adv_mean,          global_step)
         writer.add_scalar("internal_signals/advantage_std",          adv_std,           global_step)
+        writer.add_scalar("internal_signals/explained_variance",     explained_var,     global_step)
+        writer.add_scalar("internal_signals/grad_norm_slope",        gnorm_slope,       global_step)
+        writer.add_scalar("internal_signals/expl_var_slope",         expl_var_slope,    global_step)
+        writer.add_scalar("internal_signals/param_delta_actor",      param_delta_actor,  global_step)
+        writer.add_scalar("internal_signals/param_delta_critic",     param_delta_critic, global_step)
+        writer.add_scalar("internal_signals/param_delta_slope",      param_delta_slope,  global_step)
+        writer.add_scalar("internal_signals/actor_gnorm_slope",      actor_gnorm_slope,  global_step)
+        writer.add_scalar("internal_signals/critic_gnorm_slope",     critic_gnorm_slope, global_step)
 
         # Episodic stats (only when episodes completed this rollout)
         if not np.isnan(mean_return):
@@ -405,6 +483,7 @@ if __name__ == "__main__":
 
         # Curriculum tracking
         writer.add_scalar("curriculum/level",                current_level,         global_step)
+        writer.add_scalar("curriculum/active_level",         active_level,          global_step)
         writer.add_scalar("curriculum/steps_since_expansion", steps_since_expansion, global_step)
         steps_since_expansion += 1
 
@@ -415,13 +494,47 @@ if __name__ == "__main__":
                 should_expand = (iteration % args.expand_every_n == 0)
             elif args.curriculum_strategy == "spdl":
                 should_expand = (not np.isnan(mean_return) and mean_return > args.spdl_reward_threshold)
+            elif args.curriculum_strategy == "domain_rand":
+                should_expand = (iteration % args.expand_every_n == 0)
+            elif args.curriculum_strategy == "heuristic":
+                # Two gate families:
+                #   slope-based  (_s): fire when |slope| < heuristic_eps, requires window full
+                #   point-in-time: fire when value crosses per-signal threshold arg (no window needed)
+                window_full = len(grad_norm_history) == W
+                eps = args.heuristic_eps
+                sig = args.heuristic_signal
+                _s  = lambda slope: window_full and eps > 0 and abs(slope) < eps
+                _lt = lambda val, thr: thr > 0 and val < thr   # expand when value drops below thr
+                _gt = lambda val, thr: thr > 0 and val > thr   # expand when value rises above thr
+                if   sig == "both":              should_expand = _s(gnorm_slope) and _s(expl_var_slope)
+                elif sig == "or":                should_expand = _s(gnorm_slope)  or _s(expl_var_slope)
+                elif sig == "gnorm":             should_expand = _s(gnorm_slope)
+                elif sig == "expl_var":          should_expand = _s(expl_var_slope)
+                elif sig == "actor_gnorm":       should_expand = _s(actor_gnorm_slope)
+                elif sig == "critic_gnorm":      should_expand = _s(critic_gnorm_slope)
+                elif sig == "param_delta_slope": should_expand = _s(param_delta_slope)
+                elif sig == "param_delta":       should_expand = (
+                    _lt(param_delta_actor, args.param_delta_eps) if args.actor_only_param_delta
+                    else _lt(param_delta_actor, args.param_delta_eps) and _lt(param_delta_critic, args.param_delta_eps))
+                elif sig == "adv_std":           should_expand = _lt(adv_std, args.adv_std_eps)
+                elif sig == "entropy":           should_expand = _lt(ent_mean, args.entropy_eps)
+                elif sig == "kl":                should_expand = _lt(approx_kl.item(), args.kl_eps)
+                elif sig == "clipfrac":          should_expand = _lt(float(np.mean(clipfracs)), args.clipfrac_eps)
+                elif sig == "ev_abs":            should_expand = _gt(explained_var, args.ev_abs_eps)
+                elif sig == "crit_gnorm_abs":    should_expand = _lt(float(np.mean(iter_critic_gnorms)), args.crit_gnorm_abs_eps)
             elif args.curriculum_strategy == "homeostatic":
-                pass  # placeholder — gate not yet implemented
+                pass  # placeholder — learned gate not yet implemented
 
             if should_expand:
                 current_level += 1
+                active_level = current_level
                 steps_since_expansion = 0
                 lr_reset_iteration = iteration
+                grad_norm_history.clear()   # reset slopes at level boundary
+                expl_var_history.clear()
+                actor_gnorm_history.clear()
+                critic_gnorm_history.clear()
+                param_delta_history.clear()
                 envs.close()
                 envs = gym.vector.SyncVectorEnv(
                     [make_env(current_level, i, args.capture_video, run_name) for i in range(args.num_envs)]

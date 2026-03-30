@@ -13,11 +13,11 @@ MAX_SIZE = 13
 OBS_DIM = 3 * MAX_SIZE * MAX_SIZE + 1  # 507 spatial + 1 BFS boolean hint
 
 CURRICULUM_CONFIGS = {
-    0: {"size": 5,  "n_walls": 1, "dynamic": False},
-    1: {"size": 7,  "n_walls": 1, "dynamic": False},
-    2: {"size": 11,  "n_walls": 1, "dynamic": False},
-    3: {"size": 13, "n_walls": 1, "dynamic": False},
-    4: {"size": 13, "n_walls": 6, "dynamic": True},
+    0: {"size": 5,  "n_walls": 0, "dynamic": False},
+    1: {"size": 7,  "n_walls": 0, "dynamic": False},
+    2: {"size": 11,  "n_walls": 0, "dynamic": False},
+    3: {"size": 13, "n_walls": 0, "dynamic": False},
+    4: {"size": 9, "n_walls": 1, "dynamic": True},
 }
 
 
@@ -248,7 +248,7 @@ class GridWorldEnv(gym.Env):
         shaping = (dist_before - dist_after) * 0.10
         reward = 1.0 if terminated else -0.01 + shaping
         truncated = self._step_count >= 4 * self.size * self.size
-        self._current_bfs_dist = self._bfs_path_length()
+        # self._current_bfs_dist = self._bfs_path_length()  # skip per-step BFS while walls disabled
         observation = self._get_obs()
         info = self._get_info()
 
