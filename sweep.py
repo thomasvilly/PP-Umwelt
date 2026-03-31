@@ -26,12 +26,12 @@ DOMRAND_RUNS = [
 METHODS = {
     "allo-8":    dict(curriculum_strategy="allopoietic", expand_every_n=8),
     "allo-16": dict(curriculum_strategy="allopoietic", expand_every_n=16),
-    "allo-32": dict(curriculum_strategy="allopoietic", expand_every_n=32),
+    # "allo-32": dict(curriculum_strategy="allopoietic", expand_every_n=32),
     "spdl-07": dict(curriculum_strategy="spdl"),
     "critgn":  dict(curriculum_strategy="heuristic", heuristic_signal="critic_gnorm",
                     heuristic_eps=0.001, signal_window=5),
-    "offgate": dict(curriculum_strategy="offline_gate",
-                    offline_gate_path="offline_gate_critgn.pt"),
+    # "offgate": dict(curriculum_strategy="offline_gate",
+    #                 offline_gate_path="offline_gate_critgn.pt"),
     "lev-sel": dict(curriculum_strategy="level_selector",
                     level_selector_path="offline_gate_v2.pt"),
     "domrand": dict(curriculum_strategy="domain_rand", start_level=3, max_level=3),
@@ -48,7 +48,7 @@ ENVS = {
     "skip-dyn": dict(level_sequence="1,2,4"),
 }
 
-SEEDS = [1, 9, 5]
+SEEDS = [9]
 
 RUNS = [
     {**method_cfg, **env_cfg,
