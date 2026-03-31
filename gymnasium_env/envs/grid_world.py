@@ -237,16 +237,25 @@ class GridWorldEnv(gym.Env):
         direction = self._action_to_direction[action]
         new_loc = np.clip(self._agent_location + direction, 0, self.size - 1)
         nx, ny = int(new_loc[0]), int(new_loc[1])
-        # Only move if the destination is not a wall cell
-        dist_before = float(np.linalg.norm(self._agent_location - self._target_location, ord=1))
+        old_location = self._agent_location.copy()
         if not self._wall_mask[ny, nx]:
             self._agent_location = new_loc
-        dist_after = float(np.linalg.norm(self._agent_location - self._target_location, ord=1))
 
         self._step_count += 1
         terminated = bool(np.array_equal(self._agent_location, self._target_location))
-        shaping = (dist_before - dist_after) * 0.10
-        reward = 1.0 if terminated else -0.01 + shaping
+
+        # Directional shaping: dot product of actual movement with unit vector toward goal.
+        # Rewards any step that moves toward goal (graded by angle), penalises moving away.
+        # Wall collisions produce zero movement → zero shaping (just the step cost).
+        goal_vec = self._target_location.astype(float) - old_location.astype(float)
+        goal_dist = float(np.linalg.norm(goal_vec))
+        if goal_dist > 0:
+            unit_to_goal = goal_vec / goal_dist
+            actual_move  = (self._agent_location - old_location).astype(float)
+            shaping = float(np.dot(actual_move, unit_to_goal)) * 0.15
+        else:
+            shaping = 0.0
+        reward = 1.0 if terminated else -0.02 + shaping
         truncated = self._step_count >= 4 * self.size * self.size
         # self._current_bfs_dist = self._bfs_path_length()  # skip per-step BFS while walls disabled
         observation = self._get_obs()

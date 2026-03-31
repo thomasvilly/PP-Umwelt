@@ -106,6 +106,9 @@ class Args:
     level_selector_path:      str  = ""     # path to offline_gate_v2.pt
     level_selector_grpo_safe: bool = False  # if True, use 3-dim GRPO signals → 7-dim input
 
+    save_model: bool = False
+    """if True, save final agent weights to checkpoints/{run_name}.pt after training"""
+
     level_sequence: str = ""
     """comma-separated curriculum level sequence, e.g. '0,1,2,3' or '0,1,3' or '0,1,2,3,4'.
     Overrides start_level/max_level when set."""
@@ -147,6 +150,9 @@ class Args:
     """the target KL divergence threshold"""
     hidden_state_size: int = 64
     """size of the hidden states in actor & critic nets"""
+    use_cnn: bool = False
+    """if True, use a shared CNN backbone (Conv→Conv→Linear) instead of flat MLP.
+    Reshapes obs[:507] to (3,13,13) spatial channels + obs[507] BFS hint."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -157,13 +163,9 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(level, idx, capture_video, run_name):
+def make_env(level, idx, capture_video, run_name, gif_start_step=0):
     def thunk():
-        if capture_video and idx == 0:
-            env = gym.make("gymnasium_env/GridWorld-v0", render_mode="rgb_array", level=level)
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make("gymnasium_env/GridWorld-v0", level=level)
+        env = gym.make("gymnasium_env/GridWorld-v0", level=level)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
 
@@ -177,32 +179,77 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
+    # Observation layout: 3×13×13 spatial (507 dims) + 1 BFS hint = 508 total
+    _SPATIAL = 507   # 3 channels × 13 × 13
+    _GRID    = 13
+
     def __init__(self, envs):
         super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), args.hidden_state_size)),
-            nn.Tanh(),
-            layer_init(nn.Linear(args.hidden_state_size, args.hidden_state_size)),
-            nn.Tanh(),
-            layer_init(nn.Linear(args.hidden_state_size, 1), std=1.0),
-        )
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), args.hidden_state_size)),
-            nn.Tanh(),
-            layer_init(nn.Linear(args.hidden_state_size, args.hidden_state_size)),
-            nn.Tanh(),
-            layer_init(nn.Linear(args.hidden_state_size, envs.single_action_space.n), std=0.01),
-        )
+        n_act = envs.single_action_space.n
+        h     = args.hidden_state_size
+
+        if args.use_cnn:
+            # Shared CNN backbone: (3,13,13) → conv → conv → flatten → cat BFS → Linear → Tanh
+            # stride=2 on second conv: 13 → 7  (floor((13+2-3)/2)+1 = 7)
+            cnn_out = 32 * 7 * 7 + 1   # +1 for BFS hint
+            self.backbone = nn.Sequential(
+                layer_init(nn.Conv2d(3, 16, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2)),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            self.neck = nn.Sequential(
+                layer_init(nn.Linear(cnn_out, h)),
+                nn.Tanh(),
+            )
+            self.critic_head = layer_init(nn.Linear(h, 1), std=1.0)
+            self.actor_head  = layer_init(nn.Linear(h, n_act), std=0.01)
+        else:
+            obs_dim = int(np.array(envs.single_observation_space.shape).prod())
+            self.critic = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, h)), nn.Tanh(),
+                layer_init(nn.Linear(h, h)),       nn.Tanh(),
+                layer_init(nn.Linear(h, 1), std=1.0),
+            )
+            self.actor = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, h)), nn.Tanh(),
+                layer_init(nn.Linear(h, h)),       nn.Tanh(),
+                layer_init(nn.Linear(h, n_act), std=0.01),
+            )
+
+    def _encode(self, x):
+        spatial = x[:, :self._SPATIAL].reshape(-1, 3, self._GRID, self._GRID)
+        bfs     = x[:, self._SPATIAL:]          # (batch, 1)
+        return self.neck(torch.cat([self.backbone(spatial), bfs], dim=1))
+
+    def actor_parameters(self):
+        if args.use_cnn:
+            return list(self.backbone.parameters()) + list(self.neck.parameters()) + list(self.actor_head.parameters())
+        return list(self.actor.parameters())
+
+    def critic_parameters(self):
+        if args.use_cnn:
+            return list(self.backbone.parameters()) + list(self.neck.parameters()) + list(self.critic_head.parameters())
+        return list(self.critic.parameters())
 
     def get_value(self, x):
+        if args.use_cnn:
+            return self.critic_head(self._encode(x))
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        if args.use_cnn:
+            features = self._encode(x)
+            logits   = self.actor_head(features)
+            value    = self.critic_head(features)
+        else:
+            logits = self.actor(x)
+            value  = self.critic(x)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), value
 
 
 if __name__ == "__main__":
@@ -246,6 +293,7 @@ if __name__ == "__main__":
 
     # env setup
     current_level = _level_seq[0]
+    # Record only the last ~3 episodes: offset 300 env-steps from the end of env[0]'s lifetime
     envs = gym.vector.SyncVectorEnv(
         [make_env(current_level, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
@@ -339,8 +387,8 @@ if __name__ == "__main__":
     grad_norm_history, expl_var_history, actor_gnorm_history, critic_gnorm_history, param_delta_history = (
         deque(maxlen=W) for _ in range(5)
     )
-    actor_params_snap  = torch.cat([p.detach().cpu().flatten() for p in agent.actor.parameters()])
-    critic_params_snap = torch.cat([p.detach().cpu().flatten() for p in agent.critic.parameters()])
+    actor_params_snap  = torch.cat([p.detach().cpu().flatten() for p in agent.actor_parameters()])
+    critic_params_snap = torch.cat([p.detach().cpu().flatten() for p in agent.critic_parameters()])
 
     def linslope(buf):
         """Linear regression slope over a rolling deque. Returns 0 if fewer than 2 samples."""
@@ -521,8 +569,8 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 loss.backward()
                 # Compute separate actor/critic norms before joint clipping
-                actor_gnorm  = nn.utils.clip_grad_norm_(agent.actor.parameters(),  float('inf')).item()
-                critic_gnorm = nn.utils.clip_grad_norm_(agent.critic.parameters(), float('inf')).item()
+                actor_gnorm  = nn.utils.clip_grad_norm_(agent.actor_parameters(),  float('inf')).item()
+                critic_gnorm = nn.utils.clip_grad_norm_(agent.critic_parameters(), float('inf')).item()
                 grad_norm    = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm).item()
                 optimizer.step()
                 iter_grad_norms.append(grad_norm)
@@ -563,8 +611,8 @@ if __name__ == "__main__":
         actor_gnorm_slope  = linslope(actor_gnorm_history)
         critic_gnorm_slope = linslope(critic_gnorm_history)
         # param_delta: L2 weight change since last rollout (actor and critic separately)
-        actor_params_now   = torch.cat([p.detach().cpu().flatten() for p in agent.actor.parameters()])
-        critic_params_now  = torch.cat([p.detach().cpu().flatten() for p in agent.critic.parameters()])
+        actor_params_now   = torch.cat([p.detach().cpu().flatten() for p in agent.actor_parameters()])
+        critic_params_now  = torch.cat([p.detach().cpu().flatten() for p in agent.critic_parameters()])
         param_delta_actor  = (actor_params_now  - actor_params_snap).norm().item()
         param_delta_critic = (critic_params_now - critic_params_snap).norm().item()
         actor_params_snap, critic_params_snap = actor_params_now, critic_params_now
@@ -757,6 +805,35 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+
+    if args.capture_video:
+        import os as _os_gif
+        _gif_dir = f"videos/{run_name}"
+        _os_gif.makedirs(_gif_dir, exist_ok=True)
+        _gif_env = gym.make("gymnasium_env/GridWorld-v0", render_mode="rgb_array", level=active_level)
+        _gif_env = gym.wrappers.RecordVideo(_gif_env, _gif_dir,
+                                            episode_trigger=lambda ep: True,
+                                            name_prefix="final")
+        agent.eval()
+        for _ep in range(3):
+            _obs, _ = _gif_env.reset()
+            _done = False
+            while not _done:
+                with torch.no_grad():
+                    _obs_t = torch.tensor(_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    _act, _, _, _ = agent.get_action_and_value(_obs_t)
+                _obs, _, _term, _trunc, _ = _gif_env.step(_act.item())
+                _done = _term or _trunc
+        _gif_env.close()
+        print(f"[capture_video] 3 eval episodes recorded → {_gif_dir}/")
+
+    if args.save_model:
+        import os as _os_sm
+        _ckpt_dir = _os_sm.path.join("checkpoints", args.exp_name)
+        _os_sm.makedirs(_ckpt_dir, exist_ok=True)
+        _ckpt_path = _os_sm.path.join(_ckpt_dir, f"s{args.seed}.pt")
+        torch.save(agent.state_dict(), _ckpt_path)
+        print(f"[save_model] agent weights → {_ckpt_path}")
 
     if args.domain_rand_log_path and _dr_rows:
         import os as _os5

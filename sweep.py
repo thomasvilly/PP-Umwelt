@@ -15,7 +15,7 @@ DOMRAND_RUNS = [
     {"curriculum_strategy": "domain_rand",
      "start_level": 3,            # all 4 levels accessible from step 0
      "max_level": 3,
-     "hidden_state_size": 8,     # half-size network (transfer experiment)
+     "hidden_state_size": 64,     # half-size network (transfer experiment)
      "total_timesteps": 300_000,
      "domain_rand_log_path": f"runs/domrand_data/dr-s{seed}.npy",
      "seed": seed,
@@ -24,28 +24,28 @@ DOMRAND_RUNS = [
 ]
 
 METHODS = {
-    "allo-8":    dict(curriculum_strategy="allopoietic", expand_every_n=8),
-    "allo-16": dict(curriculum_strategy="allopoietic", expand_every_n=16),
+    # "allo-8":    dict(curriculum_strategy="allopoietic", expand_every_n=8),
+    # "allo-16": dict(curriculum_strategy="allopoietic", expand_every_n=16),
     # "allo-32": dict(curriculum_strategy="allopoietic", expand_every_n=32),
-    "spdl-07": dict(curriculum_strategy="spdl"),
-    "critgn":  dict(curriculum_strategy="heuristic", heuristic_signal="critic_gnorm",
-                    heuristic_eps=0.001, signal_window=5),
+    # "spdl-07": dict(curriculum_strategy="spdl"),
+    # "critgn":  dict(curriculum_strategy="heuristic", heuristic_signal="critic_gnorm",
+    #                 heuristic_eps=0.001, signal_window=5),
     # "offgate": dict(curriculum_strategy="offline_gate",
     #                 offline_gate_path="offline_gate_critgn.pt"),
     "lev-sel": dict(curriculum_strategy="level_selector",
                     level_selector_path="offline_gate_v2.pt"),
-    "domrand": dict(curriculum_strategy="domain_rand", start_level=3, max_level=3),
+    # "domrand": dict(curriculum_strategy="domain_rand", start_level=3, max_level=3),
 }
 
 ENVS = {
     # Original 4-level curriculum: 5×5 → 7×7 → 11×11 → 13×13 (no walls, static)
     "4lv":  dict(level_sequence="0,1,2,3"),
     # 5-level: adds 9×9 with 1 dynamic wall — qualitative shift (stochastic obstacles)
-    "5lv":  dict(level_sequence="0,1,2,3,4"),
+    # "5lv":  dict(level_sequence="0,1,2,3,4"),
     # Skip 11×11: forces a large difficulty jump from 7×7 directly to 13×13
-    "skip": dict(level_sequence="0,1,3"),
+    # "skip": dict(level_sequence="0,1,3"),
     # 5 -> 11 -> 9x9 dynamic
-    "skip-dyn": dict(level_sequence="1,2,4"),
+    "skip-dyn": dict(level_sequence="0,1,4"),
 }
 
 SEEDS = [9]
@@ -61,7 +61,58 @@ RUNS = [
     for seed in SEEDS
 ]
 
-# RUNS = DOMRAND_RUNS # to generate the domain randomization data to train offline gate
+ALLO_PE_RUNS = [
+    {"curriculum_strategy": "allopoietic", "expand_every_n": n,
+     "level_sequence": "0,1,2,3",
+     "total_timesteps": 1_000_000,
+     "seed": 9,
+     "exp_name": f"allo-{n}-4lv-b1M-s9"}
+    for n in [8, 32, 64]
+]
+
+MAIN_1M_METHODS = {
+    "allo-8":  dict(curriculum_strategy="allopoietic", expand_every_n=8),
+    "allo-16": dict(curriculum_strategy="allopoietic", expand_every_n=16),
+    "critgn":  dict(curriculum_strategy="heuristic", heuristic_signal="critic_gnorm",
+                    heuristic_eps=0.001, signal_window=5),
+    "lev-sel": dict(curriculum_strategy="level_selector",
+                    level_selector_path="offline_gate_v2.pt"),
+}
+
+MAIN_1M_RUNS = [
+    {**method_cfg, **env_cfg,
+     "total_timesteps": 1_000_000,
+     "capture_video": True,
+     "seed": 9,
+     "exp_name": f"{mname}-{ename}-b1M-s9"}
+    for mname, method_cfg in MAIN_1M_METHODS.items()
+    for ename, env_cfg in ENVS.items()
+]
+
+# RUNS = DOMRAND_RUNS   # Phase A: collect domain-rand data for offline gate
+# RUNS = ALLO_PE_RUNS   # allo expand_every_n ∈ {8,32,64} at 1M — PE comparison
+RUNS = MAIN_1M_RUNS     # main 1M sweep: allo-8/16, critgn, lev-sel × 4 envs
+
+
+GIF_RUNS = [
+    {"curriculum_strategy": "allopoietic", "expand_every_n": 8,
+     "level_sequence": "0,1,2,3", "total_timesteps": 200_000,
+     "capture_video": True, "seed": 9, "exp_name": "gif-allo8-4lv-200k"},
+    {"curriculum_strategy": "heuristic", "heuristic_signal": "critic_gnorm",
+     "heuristic_eps": 0.001, "signal_window": 5,
+     "level_sequence": "0,1,2,3", "total_timesteps": 200_000,
+     "capture_video": True, "seed": 9, "exp_name": "gif-critgn-4lv-200k"},
+    {"curriculum_strategy": "level_selector", "level_selector_path": "offline_gate_v2.pt",
+     "level_sequence": "0,1,2,3", "total_timesteps": 200_000,
+     "capture_video": True, "seed": 9, "exp_name": "gif-levsel-4lv-200k"},
+    {"curriculum_strategy": "level_selector", "level_selector_path": "offline_gate_v2.pt",
+     "level_sequence": "0,1,2,3,4", "total_timesteps": 200_000,
+     "capture_video": True, "seed": 9, "exp_name": "gif-levsel-5lv-200k"},
+    {"curriculum_strategy": "level_selector", "level_selector_path": "offline_gate_v2.pt",
+     "level_sequence": "0,1,2,3,4", "total_timesteps": 400_000,
+     "capture_video": True, "seed": 9, "exp_name": "gif-levsel-5lv-400k"},
+]
+# RUNS = GIF_RUNS # to generate the data for the GIFs
 
 def run_one(cfg: dict) -> tuple:
     exp_name = cfg["exp_name"]
